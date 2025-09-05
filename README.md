@@ -91,15 +91,36 @@ It reflects my **DevOps expertise** across:
 
 ## 📊 CI/CD Flow Diagram  
 
-```mermaid
 flowchart TD
-  A[Pull Request] --> B[Run Unit Tests + Coverage ≥95%]
-  B --> C[SonarCloud Scan]
-  C -->|Merge to dev| D[Auto Merge Migrations]
-  D --> E[Restore RDS Snapshot for Migration Test]
-  E -->|Fail| F[Slack: Migration Failed + Rollback DB]
-  E -->|Pass| G[Build Docker Images (Web + Celery)]
-  G --> H[Push Images to AWS ECR]
-  H --> I[Update ECS Task Definitions]
-  I --> J[Deploy to ECS Services]
-  J --> K[Slack: Pipeline Passed]
+  A["Pull Request"] --> B["Run Unit Tests + Coverage ≥95%"]
+  B --> C["SonarCloud Scan"]
+  C -->|Merge to dev| D["Auto Merge Migrations"]
+  D --> E["Restore RDS Snapshot for Migration Test"]
+  E -->|Fail| F["Slack: Migration Failed + Rollback DB"]
+  E -->|Pass| G["Build Docker Images (Web + Celery)"]
+  G --> H["Push Images to AWS ECR"]
+  H --> I["Update ECS Task Definitions"]
+  I --> J["Deploy to ECS Services"]
+  J --> K["Slack: Pipeline Passed"]
+
+## 📂 Repository Structure  
+
+```bash
+.
+├── Dockerfile                   # Web app (Django + Nginx + Gunicorn)
+├── Dockerfile.Celery             # Celery worker image
+├── docker-compose.docker.yml     # Local dev stack (Postgres, Redis, App)
+├── docker-compose.bitbucket.yml  # CI-only Postgres service
+├── entrypoint.sh                 # Web startup (migrations, collectstatic, gunicorn)
+├── entrypoint-celery.sh          # Celery worker startup
+├── nginx.conf                    # Nginx reverse proxy config
+├── gunicorn.conf.py              # Gunicorn WSGI config
+├── bitbucket-pipelines.yml       # Full CI/CD pipeline definition
+├── sonar-project.properties      # SonarCloud config
+├── .env.example                  # Safe sample env vars
+├── scripts/
+│   ├── create-new-task-def.sh
+│   ├── create-new-task-def-celery.sh
+│   └── report-build-result.sh
+└── README.md
+```
