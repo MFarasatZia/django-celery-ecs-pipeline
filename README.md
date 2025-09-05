@@ -91,17 +91,20 @@ It reflects my **DevOps expertise** across:
 
 ## 📊 CI/CD Flow Diagram  
 
+```mermaid
 flowchart TD
   A["Pull Request"] --> B["Run Unit Tests + Coverage ≥95%"]
   B --> C["SonarCloud Scan"]
   C -->|Merge to dev| D["Auto Merge Migrations"]
-  D --> E["Restore RDS Snapshot for Migration Test"]
+  D --> E{Migration Test (RDS Snapshot)}
   E -->|Fail| F["Slack: Migration Failed + Rollback DB"]
   E -->|Pass| G["Build Docker Images (Web + Celery)"]
   G --> H["Push Images to AWS ECR"]
   H --> I["Update ECS Task Definitions"]
   I --> J["Deploy to ECS Services"]
   J --> K["Slack: Pipeline Passed"]
+```
+
 
 ## 📂 Repository Structure  
 
