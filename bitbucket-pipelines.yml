@@ -1,0 +1,394 @@
+image: python:3.13
+pipelines:
+  pull-requests:
+    "**":
+      - step:
+          size: 4x
+          name: Run Unit Tests
+          runs-on:
+            - self.hosted
+            - linux
+          services:
+            - postgres
+          caches:
+            - pip
+          script:
+            - |
+              if [[ "$BITBUCKET_PR_DESTINATION_BRANCH" != "dev" && \
+                    "$BITBUCKET_PR_DESTINATION_BRANCH" != "staging" && \
+                    "$BITBUCKET_PR_DESTINATION_BRANCH" != "main" ]]; then
+                echo "Skipping: PR is not targeting dev/staging/main"
+                exit 0
+              fi
+
+            # Set environment variables
+            - export NAME=demo_db
+            - export USER=demo_user
+            - export PASSWORD=demo_pass
+            - export HOST=localhost
+            - export PORT=5432
+            - export MODE=dev
+            - export STAGE=local
+            - export LAUNCHDARKLY_SDK_KEY=$LD_BACKEND_SDK_KEY
+
+            # Upgrade pip and install dependencies
+            - python -m pip install --upgrade pip
+            - pip install poetry
+            - poetry config virtualenvs.create false
+            - poetry lock
+            - poetry install
+
+            # Run unit tests
+            - coverage run manage.py test --settings=demo_backend.test_settings
+            - coverage report --fail-under=95
+            - coverage xml
+
+          artifacts:
+            - coverage.xml
+      - step:
+          name: SonarQube Scan Back-End
+          runs-on:
+            - self.hosted
+            - linux
+          image: sonarsource/sonar-scanner-cli:latest
+          script:
+            - |
+              export SONAR_TOKEN=$SONAR_TOKEN
+
+              sonar-scanner \
+                -Dsonar.projectKey=acme_backend \
+                -Dsonar.organization=acme \
+                -Dsonar.sources=demo_backend,common,proficiency \
+                -Dsonar.exclusions=**/__pycache__/**,static/**,*.yml,*.sh,*.md,*.txt,*.lock,*.conf,*.dockerignore,*.gitignore,Dockerfile,docker-compose*.yml \
+                -Dsonar.python.coverage.reportPaths=coverage.xml \
+                -Dsonar.host.url=https://sonarcloud.io \
+                -Dsonar.token=$SONAR_TOKEN \
+                -Dsonar.pullrequest.key=$BITBUCKET_PR_ID \
+                -Dsonar.pullrequest.branch=$BITBUCKET_BRANCH \
+                -Dsonar.pullrequest.base=$BITBUCKET_PR_DESTINATION_BRANCH
+          downloads:
+            - step: "Run Unit Tests"
+
+  branches:
+    dev:
+      - step:
+          name: Handle Post-Merge Migrations
+          runs-on:
+            - self.hosted
+            - linux
+          services:
+            - postgres
+          image: python:3.13
+          caches:
+            - pip
+          script:
+            - export NAME=demo_db
+            - export USER=demo_user
+            - export PASSWORD=demo_pass
+            - export HOST=localhost
+            - export PORT=5432
+            - export MODE=dev
+            - export STAGE=dev
+            - export LAUNCHDARKLY_SDK_KEY=$LD_BACKEND_SDK_KEY
+
+            # Wait for PostgreSQL to be ready
+            - |
+              for i in {1..10}; do
+                if pg_isready -h localhost -p 5432 -U demo_user; then
+                  echo "PostgreSQL is ready"; break
+                fi
+                echo "Waiting for PostgreSQL..."; sleep 5
+              done
+
+            # Install Poetry and dependencies
+            - pip install --upgrade pip
+            - curl -sSL https://install.python-poetry.org | python3 -
+            - export PATH="$HOME/.local/bin:$PATH"
+            - poetry config virtualenvs.create false
+            - poetry lock
+            - poetry install --without dev
+
+            # Run makemigrations
+            - python manage.py makemigrations --merge --noinput --settings=demo_backend.settings.dev
+
+            # Commit and push changes if any
+            - git config --global user.name "bitbucket-pipelines"
+            - git config --global user.email "bitbucket-pipelines@bitbucket.org"
+            - git remote set-url origin https://$BB_USERNAME:$BB_APP_PASSWORD@bitbucket.org/$BITBUCKET_REPO_FULL_NAME.git
+            - git add .
+            - |
+              git diff --cached --quiet || git commit -m "Auto-commit: Merged migrations [skip ci]"
+            - git push origin dev
+
+      - step:
+          size: 4x
+          name: Bitbucket Build + Test + Deploy
+          runs-on:
+            - self.hosted
+            - linux
+          deployment: dev
+          services:
+            - docker
+          caches:
+            - pip
+          script:
+            - export SLACK_INCOMING_WEBHOOK=$SLACK_INCOMING_WEBHOOK
+            - set -e
+            - |
+              function send_slack_message {
+              local STATUS="$1"
+              local COLOR="$2"
+              local BUTTON_TEXT="$3"
+              local BUTTON_STYLE="$4"
+              local MESSAGE="$5"
+              local BUILD_URL="https://bitbucket.org/${BITBUCKET_REPO_FULL_NAME}/addon/pipelines/home#!/results/${BITBUCKET_BUILD_NUMBER}"
+              local TIMESTAMP=$(date +%s)
+
+              curl -X POST -H "Content-type: application/json" --data @- "$SLACK_INCOMING_WEBHOOK" <<EOF
+              {
+                "text": "$MESSAGE",
+                "attachments": [
+                  {
+                    "color": "$COLOR",
+                    "author_name": "${BITBUCKET_COMMIT_AUTHOR}",
+                    "author_icon": "https://bitbucket.org/account/user/${BITBUCKET_COMMIT_AUTHOR}/avatar/32/",
+                    "fields": [
+                      { "title": "Job", "value": "Backend Pipeline", "short": true },
+                      { "title": "Build", "value": "#${BITBUCKET_BUILD_NUMBER}", "short": true },
+                      { "title": "Environment", "value": "${BITBUCKET_DEPLOYMENT_ENVIRONMENT}", "short": true }
+                    ],
+                    "footer": "Bitbucket CI",
+                    "footer_icon": "https://bitbucket.org/account/user/avatar/32/",
+                    "ts": $TIMESTAMP,
+                    "actions": [
+                      {
+                        "type": "button",
+                        "text": "$BUTTON_TEXT",
+                        "url": "$BUILD_URL",
+                        "style": "$BUTTON_STYLE"
+                      }
+                    ]
+                  }
+                ]
+              }
+              EOF
+              }
+
+            # Capture start time
+            - START_TIME=$(date +%s)
+
+            # Slack on error (trap)
+            - |
+              trap '
+                END_TIME=$(date +%s)
+                DURATION=$((END_TIME - START_TIME))
+                MIN=$((DURATION / 60))
+                SEC=$((DURATION % 60))
+                send_slack_message "❌ *Backend Pipeline FAILED!*" "#FF0000" "View Logs" "danger" "❌ *Pipeline FAILED*\nTriggered by: ${BITBUCKET_COMMIT_AUTHOR}\nBranch: \`${BITBUCKET_BRANCH}\`\nBuild: #${BITBUCKET_BUILD_NUMBER}\nDuration: ${MIN}m ${SEC}s"
+                exit 1
+              ' ERR
+
+            # Build tags
+            - export SHORT_SHA=${BITBUCKET_COMMIT:0:7}
+            - export BUILD_DATE=$(date +%F)
+            - export IMAGE_NAME=acme-$BITBUCKET_DEPLOYMENT_ENVIRONMENT
+            - export IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_NAME
+            - export VERSION_TAG="$BUILD_DATE-$SHORT_SHA"
+            - export SERVICE_NAME="acme-$BITBUCKET_DEPLOYMENT_ENVIRONMENT"
+            - export SERVICE_NAME_CELERY="celery-$BITBUCKET_DEPLOYMENT_ENVIRONMENT"
+            - export IMAGE_REPO_NAME="acme-$BITBUCKET_DEPLOYMENT_ENVIRONMENT"
+            - export CLUSTER_NAME="acme-$BITBUCKET_DEPLOYMENT_ENVIRONMENT"
+            - export MODE=dev
+            - export STAGE=dev
+            - export AWS_STORAGE_BUCKET_NAME=$DEV_AWS_STORAGE_BUCKET_NAME
+            - export AWS_S3_CUSTOM_DOMAIN=$DEV_AWS_S3_CUSTOM_DOMAIN
+            - export AWS_S3_ACCESS_KEY_ID=$DEV_AWS_S3_ACCESS_KEY_ID
+            - export AWS_S3_SECRET_ACCESS_KEY=$DEV_AWS_S3_SECRET_ACCESS_KEY
+
+            # install awscli
+            - apt-get update && apt-get install -y awscli
+
+            # Logging in to Amazon ECR
+            - echo Logging in to Amazon ECR...
+            - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+
+            # Download python dependencies
+            - curl -sSL https://install.python-poetry.org | python3 -
+            - export PATH="$HOME/.local/bin:$PATH"
+            - poetry config virtualenvs.create false
+            - poetry lock
+            - |
+              echo "Installing dependencies with Poetry..."
+              poetry install || { echo "❌ Poetry install failed"; exit 1; }
+            - poetry --version
+            # Running Migration Tests
+            - echo "Running migration Test"
+            # Getting latest snapshot
+            - export DB_SNAPSHOT=$(aws rds describe-db-snapshots --region $AWS_DEFAULT_REGION --db-instance-identifier postgres-demo-staging --query "reverse(sort_by(DBSnapshots, &SnapshotCreateTime))[0].DBSnapshotIdentifier" --output text)
+            - export DB_IDENTIFIER="demo-db-test"
+
+            # Creating test DB
+            - |
+              EXISTS=$(aws rds describe-db-instances \
+                        --db-instance-identifier "$DB_IDENTIFIER" \
+                        --region $AWS_DEFAULT_REGION \
+                        --query "DBInstances[0].DBInstanceIdentifier" \
+                        --output text 2>/dev/null || echo "not-found")
+
+            - |
+              if [ "$EXISTS" == "$DB_IDENTIFIER" ]; then
+                echo "Existing dummy DB found. Deleting..."
+                aws rds delete-db-instance \
+                  --db-instance-identifier "$DB_IDENTIFIER" \
+                  --region $AWS_DEFAULT_REGION \
+                  --skip-final-snapshot >/dev/null
+                aws rds wait db-instance-deleted \
+                  --region $AWS_DEFAULT_REGION \
+                  --db-instance-identifier "$DB_IDENTIFIER"
+
+                sleep 50
+                echo "Old test DB deleted."
+              fi
+
+            - echo Creating Test DB...
+            - |
+              aws rds restore-db-instance-from-db-snapshot \
+                --db-instance-identifier $DB_IDENTIFIER \
+                --region $AWS_DEFAULT_REGION \
+                --db-snapshot-identifier $DB_SNAPSHOT \
+                --vpc-security-group-ids "$RDS_SG_ID" \
+                --db-instance-class db.t3.micro \
+                --no-multi-az \
+                --publicly-accessible
+
+            - |
+              aws rds wait db-instance-available \
+                --db-instance-identifier $DB_IDENTIFIER
+
+            - echo "Test DB created"
+            - sleep 50
+
+            - |
+              DB_DETAILS=$(aws rds describe-db-instances \
+                            --region $AWS_DEFAULT_REGION \
+                            --db-instance-identifier $DB_IDENTIFIER \
+                            --query "DBInstances[0].[Endpoint.Address, MasterUsername]" \
+                            --output text)
+            - echo $DB_DETAILS
+            - export HOST=$(echo "$DB_DETAILS" | awk '{print $1}')
+            - export USER=$(echo "$DB_DETAILS" | awk '{print $2}')
+            - export PASSWORD=$RDS_PASSWORD
+            - echo $HOST
+
+            # Run migration and capture exit code
+            - set +e
+            - python manage.py migrate --settings=demo_backend.settings.dev
+            - MIGRATE_EXIT_CODE=$?
+
+            # Re-enable exit on error for rest of pipeline
+            - set -e
+
+            # Check result
+            - |
+              if [ $MIGRATE_EXIT_CODE -ne 0 ]; then
+                echo "Migration failed with exit code $MIGRATE_EXIT_CODE. Deleting test DB..."
+                aws rds delete-db-instance \
+                  --db-instance-identifier "$DB_IDENTIFIER" \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --skip-final-snapshot >/dev/null
+                exit $MIGRATE_EXIT_CODE
+              fi
+
+            # Deleting Test DB
+            - echo "Deleting Test DB"
+            - |
+              aws rds delete-db-instance \
+                  --db-instance-identifier "$DB_IDENTIFIER" \
+                  --region $AWS_DEFAULT_REGION \
+                  --skip-final-snapshot >/dev/null
+
+            # Build the image
+            - |
+              echo "Building Docker image: $IMAGE_NAME:latest"
+
+            - docker build -t $IMAGE_NAME:latest . || { echo "Docker build failed"; exit 1; }
+
+            # Build Celery image
+            - |
+              echo "Building Celery Docker image: $IMAGE_NAME:latest"
+
+            - docker build -f Dockerfile.Celery -t $IMAGE_NAME-celery:latest . || { echo "Celery Docker build failed"; exit 1; }
+
+            # Tag with commit SHA and latest
+            - docker tag $IMAGE_NAME:latest $IMAGE_URI:$VERSION_TAG
+            - docker tag $IMAGE_NAME:latest $IMAGE_URI:latest
+            - docker tag $IMAGE_NAME-celery:latest $IMAGE_URI:$VERSION_TAG-celery
+            - docker tag $IMAGE_NAME-celery:latest $IMAGE_URI:latest-celery
+
+            # Post-build Phase
+            - chmod +x ./report-build-result.sh
+            - ./report-build-result.sh
+
+            - |
+              if [ $? -ne 0 ]; then
+                echo "Previous step failed, skipping post-build commands"
+                exit 1
+              fi
+
+            - echo PostBuild Phase
+
+            # Push both tags
+            - echo "Pushing Docker image to ECR..."
+            - docker push $IMAGE_URI:$VERSION_TAG
+            - docker push $IMAGE_URI:latest
+            - docker push $IMAGE_URI:$VERSION_TAG-celery
+            - docker push $IMAGE_URI:latest-celery
+
+            - echo "  → Image pushed with:"
+            - echo "  → $IMAGE_URI:$VERSION_TAG"
+            - echo "  → $IMAGE_URI:latest"
+            - echo "  → $IMAGE_URI:$VERSION_TAG-celery"
+            - echo "  → $IMAGE_URI:latest-celery"
+
+            - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_NAME:latest
+            - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_NAME:latest-celery
+
+            - apt-get update && apt-get install -y jq
+            - chmod +x ./create-new-task-def.sh
+            - ./create-new-task-def.sh $SERVICE_NAME taskdef.json $IMAGE_REPO_NAME $CLUSTER_NAME
+
+            - chmod +x ./create-new-task-def-celery.sh
+            - ./create-new-task-def-celery.sh $SERVICE_NAME_CELERY taskdef-celery.json $IMAGE_REPO_NAME $CLUSTER_NAME
+
+            - |
+              END_TIME=$(date +%s)
+              DURATION=$((END_TIME - START_TIME))
+              MIN=$((DURATION / 60))
+              SEC=$((DURATION % 60))
+            - |
+              send_slack_message \
+              "✅ *Backend Pipeline Passed!*" \
+              "#36a64f" \
+              "View Build" \
+              "primary" \
+              "✅ *Pipeline PASSED*\nTriggered by: ${BITBUCKET_COMMIT_AUTHOR}\nBranch: \`${BITBUCKET_BRANCH}\`\nBuild: #${BITBUCKET_BUILD_NUMBER}\nDuration: ${MIN}m ${SEC}s"
+
+          artifacts:
+            - coverage.xml
+
+definitions:
+  services:
+    postgres:
+      image: postgres:15
+      environment:
+        POSTGRES_DB: demo_db
+        POSTGRES_USER: demo_user
+        POSTGRES_PASSWORD: demo_pass
+        POSTGRES_HOST_AUTH_METHOD: trust
+      ports:
+        - "5432:5432"
+      command:
+        - --health-cmd=pg_isready -U demo_user
+        - --health-interval=10s
+        - --health-timeout=5s
+        - --health-retries=5

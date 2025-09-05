@@ -1,0 +1,15 @@
+services:
+  db:
+    image: public.ecr.aws/docker/library/postgres:15.7
+    environment:
+      - POSTGRES_DB=demo_db
+      - POSTGRES_PASSWORD=demo_pass
+      - POSTGRES_USER=demo_user
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - $BITBUCKET_CLONE_DIR/db-data-pg:/var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+
+volumes:
+  db-data-pg:
